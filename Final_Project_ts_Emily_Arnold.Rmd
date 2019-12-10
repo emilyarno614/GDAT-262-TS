@@ -1,0 +1,555 @@
+---
+title: "Final Project Time Series"
+author: "Emily Arnold"
+date: "12/1/2019"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("C:/Users/Emily/Documents/Data Science/Time Series")
+
+# Installations from CRAN
+c("data.table",     # Fast data reading; shift()
+  "dtplyr",         # dplyr done with data.table
+  "forecast",       # forecasting
+  "here",           # Better folder structure
+  "MASS",           # fitdistr()
+  "MTS",            # Multivariate time series
+  "plotly",         # For 3-d and interactive plots
+  "tidyverse",      # For data manipulation
+  "tseries",        # Some time series functions
+  "xts",            # More time series functions
+  "zoo",
+  "tsfeatures",
+  "rpart",
+  "rattle",
+  "TSA",
+  "ggplot2",
+  "keras") -> package_names  
+
+for(package_name in package_names) {
+  if(!is.element(package_name, installed.packages()[,1])) {
+     install.packages(package_name,
+                      repos = "http://cran.mtu.edu/")
+  }
+  library(package_name, character.only=TRUE,
+          quietly=TRUE,verbose=FALSE)
+}
+
+```
+
+Introduction to dataset:RSI
+
+I was inspired by the recent snowfall we have been getting, and decided to look into this dataset which tracks the severity of snowstorms in this part of the US over time. 
+
+My research questions here are... can you predict how severely snow is going to affect a region year to year and is there any seasonality to it? Some people thing that a bad winter one year means a mild one the next. I'd like to see if there is any
+
+It works with an index called RSI from the National Centers for Environmental Information, and it's based on "the spatial extent of the storm, the amount of snowfall, and the juxtaposition of these elements with population." So not only does it look at hard numbers for snowfall, but it incorporates societal impac using population data based on the 2000 Census.
+
+I acquired this dataset from here: https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/gov.noaa.ncdc:C00465/html
+
+In terms of timeline, it dates back to 1900, and includes 8 different regions: Northeast, Northern Rockies and Plains, Ohio Valley, South, Southeast, Upper Midwest, Northern Plains and Rockies, and National. 
+
+I'm going to start by reading in this csv, and taking a look at what needs to be cleaned/adjusted.
+
+```{r load dataset}
+
+snow <- read.csv("regional-snowfall-index.csv")
+str(snow)
+
+```
+
+The first thing I am noticing is that the "date" for this dataset is actually two values - start and end - and that they are both factors right now. I'll adjust both to make them actual dates right now, and figure out in a second whether I need both or can just use one.
+
+My most important variable, which will be the subject of the time series is RSI. Again, it stands for "Regional Snow Index" and it represents the severity of snow storms. 
+
+Other columns of interest for me are the Year/Month category, which I can use for aggregation if desired. Also, there is a code for region, which could come in handy if I want to think about this geographically.
+
+
+```{r fixing date}
+
+snow$Start <- as.Date(snow$Start, "%Y-%m-%d")
+snow$End <- as.Date(snow$End, "%Y-%m-%d")
+
+```
+
+There's a lot of data here I don't need. I'm going to go with the start date, RSI, region, year, and month.
+
+```{r pruning}
+
+snow2 <- snow[,c("Start", "RSI", "REGION", "YEAR", "MONTH")]
+str(snow2)
+head(snow2)
+
+summary(snow2$YEAR)
+
+
+
+```
+
+So I have about 3000 observations here - beginning in 1900, ending in 2013. There is obviously missing data here, and there's not much I can do about it because snow doesn't happen year round in most parts of the US.
+
+Also, something odd about this data is that it isn't arranged by date. 
+
+I'm going to arrange it by date and then plot it.
+
+```{r arranging}
+snow3 <- snow2 %>% 
+  arrange(.,Start)
+
+plot(snow3$RSI)
+```
+
+For EDA purposes, I'm going to group this by month and then by year, and plot it that way.
+
+```{r plotting by month}
+
+monthly <- snow3 %>% 
+           group_by(.,YEAR, MONTH) %>% 
+            summarise(.,RSI = mean(RSI))
+
+plot(monthly$RSI, type = "l", xlab = "month", ylab = "RSI")
+
+```
+
+```{r yearly}
+
+yearly <- snow3 %>% 
+           group_by(.,YEAR) %>% 
+            summarise(.,RSI = mean(RSI))
+
+plot(yearly$YEAR, yearly$RSI, type = "l", xlab = "year", ylab = "RSI")
+
+```
+
+Because of the huge gaps in this data, I'm going to stick with the yearly data. It's essentially a way to smooth the RSI data over time and look at overall trends by downsampling.
+
+```{r yearly eda}
+unique(yearly$YEAR)
+
+#missing 1911, 1928
+
+yearly[113,] <- c(1911,0)
+yearly[114,] <- c(1928,0)
+
+
+yearly %>% 
+  arrange(.,YEAR) -> yearly
+```
+
+I also want to look at this on a yearly basis by region.
+
+```{r regional, yearly}
+#grouping by 
+snow_year_region <- snow3 %>% 
+                    group_by(.,REGION,YEAR) %>% 
+                    summarize(RSI = mean(RSI))
+
+#national is not helpful - I'm dropping
+
+snow_year_region_og <- snow_year_region %>% 
+                filter(., REGION != "National")
+
+
+
+```
+
+I'm going to plot that now...
+
+```{r regional plot}
+
+ggplot(data = snow_year_region, aes(x=YEAR, y=RSI)) +
+  geom_point(aes(color = REGION))
+  
+```
+
+
+Next, I'm going to convert this dataset to a time series. It's yearly data. 
+
+```{r ts for snow}
+
+snowts <- ts(yearly, start = 1900, frequency = 1)
+plot(snowts)
+```
+
+This won't decompose properly, because of the frequency. I can remove reference to the actual year, and give it a frequency of a decade - that might make sense.
+
+```{r decompose}
+snowts_test <- ts(yearly[,"RSI"], frequency = 20)
+plot(decompose(snowts_test))
+```
+
+This decomposed plot shows a slight increasing trend over time. which peaks around the 5th decade (so, 1950).
+
+I'm now going to do our series of tests on this time series.
+
+Is it stationary, or moving?
+
+```{r stationary?}
+adf.test(snowts[,"RSI"])
+```
+
+It looks like we have a low enough p-value to reject the null hypothesis and consider this stationary.
+
+```{r diff}
+plot(diff(snowts[,"RSI"]))
+```
+
+There are some pretty big jumps in there, but overall this the differenced plot just confirms that this is boom and bust, with no underlying trends in the difference plot.
+
+Next, I'll test to see if it is normal?
+
+```{r norm}
+ks.test(snowts[,"RSI"], dnorm)
+
+#small p value means we reject the null hypothesis that these are the same -- it's normal
+
+```
+
+Unfortunately, it looks like this isn’t quite normal.  A low p-value suggests that we need to reject the null hypothesis, and the data is not similar to the normal distribution..
+
+I'm now going to check for autocorrelation and partial autocorrelation...
+
+```{r acf}
+acf(snowts[,"RSI"])
+```
+
+```{r pacf }
+pacf(snowts[,"RSI"])
+```
+
+Interesting - I'm not seeing any significant spikes in either the acf or pacf autocorrelation coefficient. That would mean that we can't reliably use a past data point to predict how severely a storm will impact a region. 
+
+```{r RSI shift}
+yearly$RSI -> xn
+shift(xn)->xnp1
+
+#plot
+plot(xnp1, xn)
+```
+
+I'm not seeing any pattern here at all, which suggests that there is little to no endogenous behavior going on.
+
+
+```{r ts}
+tsfeatures(snowts[,"RSI"])
+```
+
+```{r features}
+acf_features(snowts[,"RSI"])
+```
+
+```{r lumpiness and stability}
+lumpiness(snowts[,"RSI"])
+
+stability(snowts[,"RSI"])
+
+#periodogram
+```
+
+```{r periodogram}
+
+periodogram(snowts[,"RSI"])
+
+```
+
+
+
+```{r ets model}
+ets <- ets(snowts[,"RSI"])
+summary(ets)
+```
+
+```{r auto arima snow}
+auto.arima(snowts[,"RSI"])
+```
+
+In terms of AIC, the exponential smoothing model increased and the model got worst. 
+
+
+I'm going to shift gears a bit here, and go back to the original dataset.
+
+```{r OG}
+str(snow3)
+
+unique(snow3$REGION)
+```
+
+It looks like we have 7 different region codes. I'm going to recreate the yearly data set, but this time by region, and see whether I can cluster those regions and see which ones behave similarly.
+
+```{r yearly by region}
+
+yearly_regional_wide <- snow_year_region %>% 
+                  spread(.,key = REGION, value = RSI)
+
+#removing NA columns
+yearly_regional_wide <- yearly_regional_wide[,-c(2,4)]
+
+```
+
+
+Next, I will need to calculate the correlation matrix for this data, and check to make sure it doesn't include any NAs.
+
+```{r elec cor}
+
+
+cor(yearly_regional_wide, yearly_regional_wide, 
+    method = "pearson",
+    use = "pairwise.complete.obs") -> cor.mat
+sum(is.na(cor.mat))
+```
+
+I've generated a correlation matrix, and everything has a value. Now I just need to convert those correlation coefficients to distances.
+
+```{r elec dist}
+1 - cor.mat * cor.mat -> R2dist.mat
+as.dist(R2dist.mat) -> R2.dist
+```
+
+Now, I'm going to hierarchically cluster and plot the tree to interpret.
+
+```{r clustering}
+
+hclust(R2.dist, method = "average") -> clusters
+plot(clusters)
+
+```
+
+There are a few takeaways from this hierarchical clustering:
+
+1. The Upper Midwest has very specific snow storm behavior.
+2. The Northeast and Southeast actually have very similar behavior. That doesn't make much sense if we are just talking about snow levels - obviously the SouthEast gets way less snow overall. But it terms of how severely the storm imacts society, those two are similar.
+
+
+Next I'm going to use those two models I created to attempt to forecast these RSI levels.
+
+
+```{r forecast beijing}
+
+
+bfc <- forecast::nnetar(snowts[,"RSI"], )
+fcast <- forecast(bfc)
+plot(fcast)
+
+```
+
+I've been able to generate a small forecast, shown in blue... but it doesn't look great.
+
+I'm going to try exponential smoothing instead, even though this model did not perform as well.
+
+```{r ets forecast}
+#calling my model from earlier
+
+fc <- forecast(snowts[,"RSI"], model=ets)
+plot(fc)
+
+```
+
+This also... doesn't look great.
+
+I wonder if this would be better done by region. 
+
+Based on the dendrogram diagram of hierarchical clustering I created earlier, I am interested in the uniqueness of the upper midwest. I'll proceed by isolating that data, plotting it, and ultimately forecasting based on it...
+
+```{r just upper midwest}
+
+yearly_regional_wide$`Upper Midwest`-> reg
+
+ne <- ts(reg, start = 1900)
+plot(reg, type = "l", main = "Upper Midwest")
+```
+
+Okay, I've isolated the Northeast and converted it to a time series
+
+```{r acf midwest}
+acf(reg)
+```
+
+This is interesting! Now that I have isolated one region, there does seem to be a significant autocorrelation at lag 6, so every 6 years. 
+
+```{r pacf midwest}
+pacf(reg)
+
+```
+
+The lag is also shown in the pacf plot!
+
+```{r northeast forecast}
+
+mw_ets <- ets(reg)
+mw_fc <- forecast(reg, model=mw_ets, use.initial.values=TRUE)
+plot(mw_fc)
+
+
+```
+
+I'm going to attempt one more forecast - this time by using an ARIMA model generated with auto arima.
+
+```{r mw arima}
+
+mw_arima <- auto.arima(reg)
+mw_fc <- forecast(reg, model=mw_arima, use.initial.values=TRUE)
+plot(mw_fc)
+
+summary(mw_ets)
+summary(mw_arima)
+
+```
+
+Conclusion: efforts at forecasting are still not great - it seems to just be using the mean. I think my biggest conclusion overall is that forecasting is not viable.
+
+********************
+
+I attempted some deep learning here, because I was thinking that an LSTM would help analyze this despite the extreme ups and downs in the data. 
+
+I didn't wind up including it in my analysis, because the code didn't work. I think that there just wasn't enough data to work with.
+
+Divinding into test and training set.
+
+This dataset contains 5 years worth of data. I'm going to use the first 4 years as training, and the last year as test.
+
+```{r train and test }
+
+snowDL <- as.data.frame(yearly[,"RSI"])
+# 
+# 
+# data <- data.matrix(snowDL)
+# 
+# train_data <- data.matrix(data[1:60])
+# 
+# mean <- apply(train_data, 2, mean)
+# std <- apply(train_data, 2, sd)
+# data <- scale(data, center = mean, scale = std)
+
+```
+
+As with the first question, I'm using a generator function to create the batches I need too look back and look ahead.
+
+```{r generator beijing}
+# 
+# generator <- function(data, lookback, delay, min_index, max_index,
+#                       shuffle = FALSE, batch_size = 2, step = 1) {
+#   if (is.null(max_index))
+#     max_index <- nrow(data) - delay - 1
+#   i <- min_index + lookback
+#   function() {
+#     if (shuffle) {
+#       rows <- sample(c((min_index+lookback):max_index), size = batch_size)
+#     } else {
+#       if (i + batch_size >= max_index)
+#         i <<- min_index + lookback
+#       rows <- c(i:min(i+batch_size-1, max_index))
+#       i <<- i + length(rows)
+#     }
+# 
+#     samples <- array(0, dim = c(length(rows),
+#                                 lookback / step,
+#                                 dim(data)[[-1]]))
+#     targets <- array(0, dim = c(length(rows)))
+#                       
+#     for (j in 1:length(rows)) {
+#       indices <- seq(rows[[j]] - lookback, rows[[j]]-1,
+#                      length.out = dim(samples)[[2]])
+#       samples[j,,] <- data[indices,]
+#       targets[[j]] <- data[rows[[j]] + delay,2]
+#     }           
+#     list(samples, targets)
+#   }
+# }
+
+```
+
+Next, I am establishing parameters to run the RNN model. I want to be looking back 20 years, 1 year at a time
+
+```{r establishing parameters}
+#I'm going to start with a daily lookback
+# 
+# 
+# lookback <- 5# year lookback
+# step <- 1 # data point every year
+# delay <- 5 #delayed 12 yrs
+# batch_size <- 2
+# 
+# train_gen <- generator(
+#   data,
+#   lookback = lookback,
+#   delay = delay,
+#   min_index = 1,
+#   max_index = 50,
+#   shuffle = TRUE,
+#   step = step, 
+#   batch_size = batch_size
+# )
+# 
+# val_gen = generator(
+#   data,
+#   lookback = lookback,
+#   delay = delay,
+#   min_index = 51,
+#   max_index = 80,
+#   step = step,
+#   batch_size = batch_size
+# )
+# 
+# test_gen <- generator(
+#   data,
+#   lookback = lookback,
+#   delay = delay,
+#   min_index = 81,
+#   max_index = NULL,
+#   step = step,
+#   batch_size = batch_size
+# )
+# 
+# # How many steps to draw from val_gen in order to see the entire validation set
+# val_steps <- (81 - 51 - lookback) / batch_size
+# 
+# # How many steps to draw from test_gen in order to see the entire test set
+# test_steps <- (nrow(data) - 81 - lookback) / batch_size
+
+```
+
+I'll start with the non-machine learning, naive method as a base line.
+
+```{r eval beijing}
+
+# evaluate_naive_method <- function() {
+#   batch_maes <- c()
+#   for (step in 1:val_steps) {
+#     c(samples, targets) %<-% val_gen()
+#     preds <- samples[,dim(samples)[[2]],2]
+#     mae <- mean(abs(preds - targets))
+#     batch_maes <- c(batch_maes, mae)
+#   }
+#   print(mean(batch_maes))
+# }
+# 
+# evaluate_naive_method()
+```
+
+I can't seem to get this evaluation to work - it seems to be out of bounds. I've adjusted the parameters several times to attempt to avoid this error, but it's not working.
+
+I'll try a model with a recurrent layer.
+
+```{r RNN snow}
+# model <- keras_model_sequential() %>% 
+#   layer_gru(units = 32, input_shape = list(NULL, dim(data)[[-1]])) %>% 
+#   layer_dense(units = 1)
+# 
+# model %>% compile(
+#   optimizer = optimizer_rmsprop(),
+#   loss = "mae"
+# )
+# 
+# history <- model %>% fit_generator(
+#   train_gen,
+#   steps_per_epoch = 2,
+#   epochs = 10,
+#   validation_data = val_gen,
+#   validation_steps = val_steps
+# )
+```
+
+Unfortunately, I'm encountering the same issue here, and adjusting the parameters to make sure we have enough validation data doesn't seem to help?
